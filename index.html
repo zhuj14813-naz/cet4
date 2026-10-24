@@ -264,7 +264,7 @@
 
         <h2 class="sec">进度管理</h2>
         <div class="card">
-          <p class="muted" style="margin-top:0">进度自动保存在本机浏览器中：每次评分或作答后自动保存，隔天打开本页即可接续 18 天计划与艾宾浩斯复习排期，无需手动操作。下方导出 / 导入仅用于换设备时备份与迁移。</p>
+          <p class="muted" id="progressNote" style="margin-top:0">进度自动保存在本机浏览器中：每次评分或作答后自动保存，隔天打开本页即可接续 18 天计划与艾宾浩斯复习排期，无需手动操作。下方导出 / 导入仅用于换设备时备份与迁移。</p>
           <p class="muted" id="saveStatus" style="margin:8px 0 12px"></p>
           <div class="btnrow">
             <button class="btn small" id="btnExport">导出进度（备份）</button>
@@ -273,7 +273,19 @@
             <button class="btn small danger" id="btnReset">重置进度</button>
           </div>
         </div>
-        <p class="foot-note">词表来源：《20天背完四级核心词汇》（你上传的 PDF），共 18 个 List、2799 词。PDF 本身只含 List 1–18（List 18 共 79 词），无 List 19、20。复习间隔按艾宾浩斯曲线：1 天 → 2 天 → 4 天 → 7 天 → 15 天，答错回到 1 天后重测。</p>
+                <h2 class="sec">词书管理</h2>
+        <div class="card">
+          <p class="muted" id="bookStatus" style="margin-top:0"></p>
+          <div class="btnrow">
+            <button class="btn small primary" id="btnImportBook">导入新词书（PDF）</button>
+            <input type="file" id="fileBook" accept=".pdf,application/pdf" hidden />
+            <button class="btn small" id="btnRestoreBook" hidden>恢复原词书</button>
+          </div>
+          <p class="muted" id="importStatus" style="margin:10px 0 0"></p>
+          <div id="importPreview" hidden style="margin-top:10px"></div>
+          <p class="muted" style="margin:10px 0 0">导入只认单词表版式：每条带编号、单词、音标、中文释义，和现在这本同版式的书解析最准。解析完会先给你看 List 数、总词数和示例，确认后才替换。</p>
+        </div>
+        <p class="foot-note" id="bookNote">词表来源：《20天背完四级核心词汇》（你上传的 PDF），共 18 个 List、2799 词。PDF 本身只含 List 1–18（List 18 共 79 词），无 List 19、20。复习间隔按艾宾浩斯曲线：1 天 → 2 天 → 4 天 → 7 天 → 15 天，答错回到 1 天后重测。</p>
       </section>
 
       <!-- ================= LISTS ================= -->
@@ -326,7 +338,9 @@
     <script>
       "use strict";
       /* ================= data ================= */
-      var LISTS = JSON.parse(document.getElementById("lists-data").textContent);
+      var IMPORTED_BOOK = loadImportedBook();
+      var LISTS = IMPORTED_BOOK ? IMPORTED_BOOK.lists : JSON.parse(document.getElementById("lists-data").textContent);
+      var IMPORTED_META = IMPORTED_BOOK || null;
       var LIST_NOS = Object.keys(LISTS).map(Number).sort(function (a, b) { return a - b; });
       var TOTAL_WORDS = LIST_NOS.reduce(function (s, n) { return s + LISTS[n].length; }, 0);
       var INTERVALS = [1, 2, 4, 7, 15]; // stage 1..5 -> days until next review
@@ -459,25 +473,76 @@
 
       /* ================= speech ================= */
       var enVoice = null;
+      var ttsState = "unknown"; /* unknown | ok | broken */
       function pickVoice() {
         try {
-          var vs = speechSynthesis.getVoices();
-          enVoice = vs.filter(function (v) { return /^en[-_]/i.test(v.lang); })[0] || null;
+          var vs = speechSynthesis.getVoices().filter(function (v) { return /^en([-_]|$)/i.test(v.lang); });
+          function score(v) {
+            var s = 0, n = (v.name || "").toLowerCase();
+            if (/^en[-_]us/i.test(v.lang)) s += 4; else if (/^en[-_]gb/i.test(v.lang)) s += 2;
+            if (v.localService) s += 2;
+            if (/albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|good news|hysterical|pipe organ|trinoids|whisper|zarvox/.test(n)) s -= 5;
+            return s;
+          }
+          vs.sort(function (a, b) { return score(b) - score(a); });
+          enVoice = vs[0] || null;
         } catch (e) { /* no tts */ }
       }
       if ("speechSynthesis" in window) {
         pickVoice();
         speechSynthesis.onvoiceschanged = pickVoice;
       }
-      function speak(text) {
-        if (!("speechSynthesis" in window)) { toast("此设备不支持语音朗读"); return; }
+      /* Fallback pronunciation: streamed dictionary audio (US accent),
+         used whenever the device voice is missing or never starts. */
+      var pronAudio = null, lastOnlineAt = 0;
+      function speakOnline(text) {
+        lastOnlineAt = Date.now();
         try {
-          speechSynthesis.cancel();
+          if (!pronAudio) {
+            pronAudio = new Audio();
+            pronAudio.preload = "auto";
+            pronAudio.addEventListener("error", function () {
+              if (Date.now() - lastOnlineAt < 4000) toast("发音播放失败：请检查网络连接，并确认设备未静音");
+            });
+          }
+          pronAudio.src = "https://dict.youdao.com/dictvoice?audio=" + encodeURIComponent(text) + "&type=2";
+          var p = pronAudio.play();
+          if (p && typeof p.catch === "function") {
+            p.catch(function () { toast("发音播放失败：请检查网络连接，并确认设备未静音"); });
+          }
+        } catch (e) { toast("发音播放失败：请检查网络连接，并确认设备未静音"); }
+      }
+      var speakSeq = 0;
+      function speak(text) {
+        text = String(text || "").trim();
+        if (!text) return;
+        var seq = ++speakSeq;
+        if (pronAudio) { try { pronAudio.pause(); } catch (e) { /* noop */ } }
+        if (!("speechSynthesis" in window) || ttsState === "broken") { speakOnline(text); return; }
+        try {
+          pickVoice();
+          var started = false;
           var u = new SpeechSynthesisUtterance(text);
-          u.lang = "en-US"; u.rate = 0.92;
+          u.lang = enVoice ? String(enVoice.lang).replace("_", "-") : "en-US";
+          u.rate = 0.92;
           if (enVoice) u.voice = enVoice;
+          u.onstart = function () { started = true; ttsState = "ok"; };
+          u.onerror = function (ev) {
+            if (seq !== speakSeq || started) return;
+            if (ev && (ev.error === "canceled" || ev.error === "interrupted")) return;
+            ttsState = "broken";
+            speakOnline(text);
+          };
+          speechSynthesis.cancel();
+          if (speechSynthesis.resume) speechSynthesis.resume();
           speechSynthesis.speak(u);
-        } catch (e) { /* ignore */ }
+          setTimeout(function () {
+            if (seq !== speakSeq || started || ttsState === "ok") return;
+            ttsState = "broken";
+            try { speechSynthesis.cancel(); } catch (e) { /* noop */ }
+            speakOnline(text);
+          }, 1200);
+        } catch (e) { ttsState = "broken"; speakOnline(text); }
       }
       var SPEAK_SVG = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.4 5.6a9 9 0 0 1 0 12.8"/></svg>';
 
@@ -534,19 +599,19 @@
             '<p class="muted">共 ' + total + ' 词，已学 ' + done + ' 词。闪卡正面看英文回忆中文，翻面核对释义，自评「认识 / 不认识」；不认识的词会在本轮稍后再次出现。</p>' +
             '<div class="track" style="margin-bottom:12px"><i style="width:' + Math.round(done / total * 100) + '%"></i></div>' +
             '<div class="btnrow"><button class="btn primary" id="btnTodayLearn">' + (done > 0 && done < total ? "继续学习" : done >= total ? "再过一遍本 List" : "开始闪卡学习") + '</button>' +
-            '<button class="btn" id="btnTodayQuiz">巩固测验（' + QUIZ_N + ' 题）</button>' +
+            '<button class="btn" id="btnTodayQuiz">巩固测验（全测 ' + total + ' 题）</button>' +
             '<button class="btn" id="btnTodayWords">查看词表</button></div>' +
             (missed.length ? '<p class="muted" style="margin-bottom:4px">之前未学完的 List：</p><div class="missed">' +
               missed.map(function (n) { return '<button data-missed="' + n + '">List ' + n + '（剩 ' + (LISTS[n].length - learnedCountOfList(n)) + ' 词）</button>'; }).join("") + "</div>" : "");
           $("btnTodayLearn").onclick = function () { startTodayLearn(ln); };
-          $("btnTodayQuiz").onclick = function () { startQuiz(allKeysOfList(ln), "List " + ln + " 巩固测验"); };
+          $("btnTodayQuiz").onclick = function () { startQuiz(allKeysOfList(ln), "List " + ln + " 巩固测验", true); };
           $("btnTodayWords").onclick = function () { openWords(ln); };
           newCard.querySelectorAll("[data-missed]").forEach(function (b) {
             b.onclick = function () { startTodayLearn(+b.getAttribute("data-missed")); };
           });
         } else {
           newCard.innerHTML =
-            '<div class="today-head"><span class="big">新词已全部学完</span><span class="tag done">18 个 List 完成</span></div>' +
+            '<div class="today-head"><span class="big">新词已全部学完</span><span class="tag done">' + LIST_NOS.length + ' 个 List 完成</span></div>' +
             '<p class="muted">词表内的 List 已全部学过。继续按下方复习计划巩固，或在「词表」里任选 List 闪卡 / 测验。</p>';
         }
 
@@ -594,7 +659,7 @@
           b.onclick = function () {
             var n = +b.getAttribute("data-list"), act = b.getAttribute("data-act");
             if (act === "flash") startFlash(allKeysOfList(n), { title: "List " + n + " 闪卡", mode: "free", listNo: n });
-            else if (act === "quiz") startQuiz(allKeysOfList(n), "List " + n + " 测验");
+            else if (act === "quiz") startQuiz(allKeysOfList(n), "List " + n + " 测验", true);
             else openWords(n);
           };
         });
@@ -662,9 +727,12 @@
       var autoSpeak = true;
       function startFlash(keys, opts) {
         if (!keys.length) { toast("没有可学习的词"); return; }
+        // 单个 List 的闪卡：每次进入都把本 List 内顺序重新打乱；
+        // 只打乱顺序，不改 List 成员，顺序不存进进度，下次进入再打乱一次。
+        // 跨 List 的复习 / 生词本不走这条分支，保持原有的到期 / 错次顺序。
         FS = {
           title: opts.title, mode: opts.mode, listNo: opts.listNo || null,
-          queue: keys.slice(), total: keys.length, flipped: false,
+          queue: opts.listNo ? shuffle(keys.slice()) : keys.slice(), total: keys.length, flipped: false,
           known: 0, unknown: 0, graded: 0
         };
         show("session");
@@ -726,9 +794,9 @@
           '<div class="card" style="text-align:center"><div class="sum-num">' + FS.known + " / " + (FS.known + FS.unknown) + "</div>" +
           '<p class="muted">本轮自评：认识 ' + FS.known + " 次，不认识 " + FS.unknown + " 次。不认识的词已按艾宾浩斯计划排到明天优先复习，生词本里也能找到它们。</p>" +
           '<div class="btnrow" style="justify-content:center">' +
-          (canQuiz ? '<button class="btn primary" id="sumQuiz">做巩固测验（' + QUIZ_N + ' 题）</button>' : "") +
+          (canQuiz ? '<button class="btn primary" id="sumQuiz">做巩固测验（全测 ' + canQuiz.length + ' 题）</button>' : "") +
           '<button class="btn" id="sumHome">返回今日页</button></div></div>';
-        if (canQuiz) $("sumQuiz").onclick = function () { startQuiz(canQuiz, FS.title + " 巩固测验"); };
+        if (canQuiz) $("sumQuiz").onclick = function () { startQuiz(canQuiz, FS.title + " 巩固测验", true); };
         $("sumHome").onclick = function () { renderHome(); show("home"); };
       }
 
@@ -748,9 +816,9 @@
         }
         return shuffle(opts);
       }
-      function startQuiz(keys, title) {
+      function startQuiz(keys, title, full) {
         if (!keys.length) { toast("没有可测验的词"); return; }
-        var sample = shuffle(keys.slice()).slice(0, QUIZ_N);
+        var sample = full ? shuffle(keys.slice()) : shuffle(keys.slice()).slice(0, QUIZ_N);
         QZ = {
           title: title, i: 0, right: 0, wrong: 0, wrongList: [],
           items: sample.map(function (k) {
@@ -878,6 +946,213 @@
         toast("进度已重置，从第 1 天重新开始");
       };
 
+      /* ================= import a new PDF word book ================= */
+      /* NOTE: loadImportedBook() is called at the LISTS definition above,
+         before this section runs, so it uses the literal storage key
+         instead of IMPORTED_KEY (whose assignment has not run yet). */
+      var IMPORTED_KEY = "cet4-imported-book-v1";
+      function loadImportedBook() {
+        try {
+          var raw = localStorage.getItem("cet4-imported-book-v1");
+          if (!raw) return null;
+          var data = JSON.parse(raw);
+          if (!data || typeof data !== "object" || !data.lists || typeof data.lists !== "object") return null;
+          var nos = Object.keys(data.lists);
+          if (!nos.length) return null;
+          for (var i = 0; i < nos.length; i++) {
+            var arr = data.lists[nos[i]];
+            if (!Array.isArray(arr) || !arr.length) return null;
+            for (var j = 0; j < arr.length; j++) {
+              var e = arr[j];
+              if (!e || typeof e.w !== "string" || typeof e.m !== "string") return null;
+              if (typeof e.p !== "string") e.p = "";
+            }
+          }
+          return data;
+        } catch (e) { return null; }
+      }
+      function cleanImportText(s) {
+        s = s.normalize("NFKC");
+        s = s.replace(/ǝ/g, "ə");
+        s = s.replace(/[\u0000-\u0009\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+        return s;
+      }
+      function parsePdfBook(full) {
+        full = cleanImportText(full);
+        /* Entry starts glued to the previous meaning line, e.g. "...内疚的97 music café[" */
+        full = full.replace(/([^\n])\s(\d{1,3})\s+([A-Za-z][A-Za-z'’\- ]+?)\s*\[/g, "$1\n$2 $3 [");
+        var lines = full.split("\n").map(function (l) { return cleanImportText(l).trim(); }).filter(function (l) { return l.length > 0; });
+        var lists = {}, cur = null, block = null, title = null;
+        function flush() {
+          if (!block || !cur) return;
+          var txt = block.join("\n");
+          var m = txt.match(/^(\d+)\s+([^\n\[]+?)\s*\[([^\]]+)\]\s*([\s\S]*)$/);
+          if (!m) return;
+          var word = m[2].trim().replace(/\s+/g, " ");
+          var phon = m[3].trim().replace(/\s+/g, "");
+          var meaning = m[4].replace(/\n/g, "").replace(/#/g, "；").replace(/\(cid:\d+\)/g, "").replace(/[（）]/g, "")
+            .replace(/\s?8(?=[\u4e00-\u9fff])/g, "").replace(/([\u4e00-\u9fff]):(?=；|$|\s)/g, "$1")
+            .replace(/\.\.\./g, "…").replace(/\b(n|v|adj|adv|prep|conj|phrase|pron|num|art|interj)\.(?=[\u4e00-\u9fff])/g, "$1. ")
+            .replace(/；\s*/g, "； ").replace(/\s+/g, " ").replace(/；\s*$/, "").trim();
+          if (!lists[cur]) lists[cur] = [];
+          lists[cur].push({ w: word, p: phon, m: meaning });
+        }
+        for (var li = 0; li < lines.length; li++) {
+          var line = lines[li];
+          var lm = line.match(/List\s+(\d+)/);
+          if (lm && (/词汇/.test(line) || /天背完/.test(line) || /^List\s+\d+$/.test(line))) {
+            if (!title) title = line.replace(/\s*List\s+\d+.*$/, "").trim() || null;
+            flush(); block = null; cur = +lm[1];
+            if (!lists[cur]) lists[cur] = [];
+            continue;
+          }
+          if (/^Vocabulary List/.test(line)) continue;
+          if (/^NO\.\s+Word\s+Meaning/.test(line)) continue;
+          if (/背单词\s*-\s*\d+$/.test(line)) continue;
+          var em = line.match(/^(\d+)\s+(.+)$/);
+          if (em && /^[A-Za-z]/.test(em[2])) {
+            if (!cur) { cur = 1; if (!lists[cur]) lists[cur] = []; }
+            flush(); block = [line];
+            continue;
+          }
+          if (block) block.push(line);
+        }
+        flush();
+        /* No List headings at all: chunk one long numbered list into 160-word Lists,
+           so the daily plan (one List per day) still works. Preview shows the split. */
+        var keys = Object.keys(lists);
+        if (keys.length === 1 && lists[keys[0]].length > 160) {
+          var all = lists[keys[0]], chunked = {};
+          for (var ci = 0; ci < all.length; ci += 160) chunked[Math.floor(ci / 160) + 1] = all.slice(ci, ci + 160);
+          lists = chunked;
+        }
+        return { lists: lists, title: title };
+      }
+      var pdfJsLoading = null;
+      function loadPdfJs() {
+        if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+        if (pdfJsLoading) return pdfJsLoading;
+        pdfJsLoading = new Promise(function (resolve, reject) {
+          var s = document.createElement("script");
+          s.src = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js";
+          s.onload = function () {
+            try {
+              if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+                window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+              }
+              resolve(window.pdfjsLib);
+            } catch (e) { reject(e); }
+          };
+          s.onerror = function () { pdfJsLoading = null; reject(new Error("pdfjs load failed")); };
+          document.head.appendChild(s);
+        });
+        return pdfJsLoading;
+      }
+      var pendingImport = null;
+      function setImportStatus(msg) { var el = $("importStatus"); if (el) el.textContent = msg; }
+      $("btnImportBook").onclick = function () { $("fileBook").click(); };
+      $("fileBook").onchange = function () {
+        var f = this.files && this.files[0];
+        this.value = "";
+        if (!f) return;
+        if (!/\.pdf$/i.test(f.name)) { setImportStatus("请选择 PDF 文件。"); return; }
+        setImportStatus("正在解析 PDF，请稍候…（首次解析需要联网加载解析组件，背单词本身仍可离线）");
+        $("importPreview").hidden = true;
+        pendingImport = null;
+        loadPdfJs().then(function (lib) {
+          return f.arrayBuffer().then(function (buf) { return lib.getDocument({ data: new Uint8Array(buf) }).promise; });
+        }).then(function (doc) {
+          var chain = Promise.resolve(""), full = "";
+          for (var i = 1; i <= doc.numPages; i++) {
+            (function (pageno) {
+              chain = chain.then(function () {
+                setImportStatus("正在解析 PDF…已读 " + pageno + " / " + doc.numPages + " 页");
+                return doc.getPage(pageno).then(function (page) {
+                  return page.getTextContent().then(function (tc) {
+                    var out = "";
+                    tc.items.forEach(function (it) { out += it.str; if (it.hasEOL) out += "\n"; });
+                    full += out + "\n";
+                  });
+                });
+              });
+            })(i);
+          }
+          return chain.then(function () { return full; });
+        }).then(function (full) {
+          var parsed = parsePdfBook(full);
+          var listNos = Object.keys(parsed.lists).map(Number).sort(function (a, b) { return a - b; });
+          var total = listNos.reduce(function (s, n) { return s + parsed.lists[n].length; }, 0);
+          if (!listNos.length || total < 20) {
+            setImportStatus("解析失败：只解析出 " + total + " 词。请确认这个 PDF 是单词表版式（带编号、单词、音标、中文释义），或换一本再试。原词书未动。");
+            return;
+          }
+          pendingImport = { lists: parsed.lists, title: parsed.title || f.name.replace(/\.pdf$/i, "") };
+          var first = parsed.lists[listNos[0]];
+          var sample = first.slice(0, 3).map(function (w) {
+            return '<div class="wrow"><div class="main"><span class="w">' + esc(w.w) + '</span><span class="p">/' + esc(w.p) + "/</span><span class=\"m\">" + esc(w.m) + "</span></div></div>";
+          }).join("");
+          $("importPreview").innerHTML =
+            '<div class="card" style="padding:12px 16px"><p style="margin:6px 0">解析出 <b>' + listNos.length + " 个 List、共 " + total + " 词</b>（" +
+            listNos.map(function (n) { return "List " + n + " " + parsed.lists[n].length + " 词"; }).join("，") +
+            '）。请核对示例，确认释义没有错乱再替换：</p>' + sample +
+            '<p class="muted" style="margin:8px 0">确认后，当前词书会被替换，旧的学习进度会清空，从第 1 天重新开始。新词书只保存在当前浏览器里，换设备或清除浏览器数据后，需要再点这个入口重新导一次（不用找我）。</p>' +
+            '<div class="btnrow"><button class="btn primary" id="btnConfirmImport">确认替换为这本词书</button>' +
+            '<button class="btn" id="btnCancelImport">取消，原词书不动</button></div></div>';
+          $("importPreview").hidden = false;
+          setImportStatus("解析完成：共 " + listNos.length + " 个 List、" + total + " 词。");
+          $("btnConfirmImport").onclick = function () {
+            if (!pendingImport) return;
+            try {
+              localStorage.setItem(IMPORTED_KEY, JSON.stringify({ v: 1, importedAt: todayStr(), title: pendingImport.title, lists: pendingImport.lists }));
+            } catch (e) {
+              setImportStatus("保存失败：浏览器存储空间不足或被禁用，原词书未动。");
+              return;
+            }
+            progress = freshProgress();
+            saveProgress();
+            location.reload();
+          };
+          $("btnCancelImport").onclick = function () {
+            pendingImport = null;
+            $("importPreview").hidden = true;
+            setImportStatus("已取消，原词书未动。");
+          };
+        }).catch(function (e) {
+          setImportStatus("解析失败：" + (e && e.message ? e.message : "未知错误") + "。请检查网络后重试，原词书未动。");
+        });
+      };
+      var restoreArmed = false, restoreTimer = null;
+      $("btnRestoreBook").onclick = function () {
+        if (!restoreArmed) {
+          restoreArmed = true;
+          this.textContent = "再点一次确认恢复原词书并清空进度";
+          restoreTimer = setTimeout(function () {
+            restoreArmed = false;
+            $("btnRestoreBook").textContent = "恢复原词书";
+          }, 3500);
+          return;
+        }
+        clearTimeout(restoreTimer);
+        restoreArmed = false;
+        this.textContent = "恢复原词书";
+        try { localStorage.removeItem(IMPORTED_KEY); } catch (e) { /* noop */ }
+        progress = freshProgress();
+        saveProgress();
+        location.reload();
+      };
+      function initBookUI() {
+        var statusEl = $("bookStatus"), restoreBtn = $("btnRestoreBook"), noteEl = $("bookNote"), progEl = $("progressNote");
+        if (IMPORTED_META) {
+          if (statusEl) statusEl.textContent = "当前词书：" + (IMPORTED_META.title || "导入的 PDF") + "（" + LIST_NOS.length + " 个 List，共 " + TOTAL_WORDS + " 词，导入于 " + (IMPORTED_META.importedAt || "") + "）";
+          if (restoreBtn) restoreBtn.hidden = false;
+          if (noteEl) noteEl.textContent = "当前词书：" + (IMPORTED_META.title || "导入的 PDF") + "（共 " + LIST_NOS.length + " 个 List、" + TOTAL_WORDS + " 词，来自你导入的 PDF）。复习间隔按艾宾浩斯曲线：1 天 → 2 天 → 4 天 → 7 天 → 15 天，答错回到 1 天后重测。";
+          if (progEl) progEl.textContent = "进度自动保存在本机浏览器中：每次评分或作答后自动保存，隔天打开本页即可接续计划与艾宾浩斯复习排期，无需手动操作。下方导出 / 导入仅用于换设备时备份与迁移。";
+        } else {
+          if (statusEl) statusEl.textContent = "当前词书：《20天背完四级核心词汇》（18 个 List，2799 词）";
+          if (restoreBtn) restoreBtn.hidden = true;
+        }
+      }
+
       /* ================= nav & init ================= */
       document.querySelectorAll(".navbtn").forEach(function (b) {
         b.onclick = function () {
@@ -892,14 +1167,14 @@
         if (currentWordsList) startFlash(allKeysOfList(currentWordsList), { title: "List " + currentWordsList + " 闪卡", mode: "free", listNo: currentWordsList });
       };
       $("btnWordsQuiz").onclick = function () {
-        if (currentWordsList) startQuiz(allKeysOfList(currentWordsList), "List " + currentWordsList + " 测验");
+        if (currentWordsList) startQuiz(allKeysOfList(currentWordsList), "List " + currentWordsList + " 测验", true);
       };
       $("btnExitSession").onclick = function () { FS = null; renderHome(); show("home"); };
       $("btnExitQuiz").onclick = function () { QZ = null; renderHome(); show("home"); };
       $("searchInput").addEventListener("input", function () { renderSearch(this.value); });
 
       if (savedProgress) $("saveStatus").textContent = "已恢复本机保存的进度 · 第 " + dayIndex() + " 天，共已学 " + counts().learned + " 词";
-      renderHome();
+      renderHome(); initBookUI();
     </script>
   </body>
 </html>
